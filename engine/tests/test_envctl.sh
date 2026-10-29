@@ -152,6 +152,58 @@ test_B3() {
     echo "    create em ${elapsed} ms; log ${size1} -> ${size2} bytes"
 }
 
+# Montagens da VM, uma por linha. Usado para provar que o /proc montado pelo
+# --mount-proc ficou só dentro do namespace de mount do ambiente.
+mounts() {
+    findmnt -rn -o TARGET,SOURCE,FSTYPE
+}
+
+test_B9() {
+    fresh 109
+    local before after log=$ENVS_DIR/109/output.log
+    before=$(mounts)
+    run create 109 "${LIMITS[@]}" --cmd "ps -eo pid,comm"
+    expect "código de saída do create" "$RC" 0
+    wait_done 109 5 || fail "não terminou em 5 s"
+    expect "status" "$(jget status)" finished
+    sed 's/^/    | /' "$log"
+    awk '$1 == 1' "$log" | grep -q . || fail "log não mostra nenhum processo com PID 1"
+    grep -wE 'systemd|sshd|cron|agetty' "$log" && fail "log mostra processos do host"
+    after=$(mounts)
+    [[ $before == "$after" ]] || fail "findmnt da VM mudou: $(diff <(echo "$before") <(echo "$after"))"
+}
+
+test_B10() {
+    fresh 110
+    local orig
+    orig=$(hostname)
+    run create 110 "${LIMITS[@]}" --cmd "hostname"
+    expect "código de saída do create" "$RC" 0
+    wait_done 110 5 || fail "não terminou em 5 s"
+    expect "status" "$(jget status)" finished
+    grep -qx env-110 "$ENVS_DIR/110/output.log" \
+        || fail "log não contém env-110: $(cat "$ENVS_DIR/110/output.log")"
+    expect "hostname da VM depois do teste" "$(hostname)" "$orig"
+    echo "    dentro: $(cat "$ENVS_DIR/110/output.log"); VM: $(hostname)"
+}
+
+test_B11() {
+    fresh 111
+    local tmp
+    tmp=$(mktemp /tmp/envctl-B11-XXXXXX.sh)
+    printf '%s\n' 'echo "linha conhecida do B11"' 'exit 5' > "$tmp"
+    run create 111 "${LIMITS[@]}" --script "$tmp"
+    expect "código de saída do create" "$RC" 0
+    wait_done 111 5 || fail "não terminou em 5 s"
+    expect "status" "$(jget status)" error
+    expect "exit_code" "$(jget exit_code)" 5
+    grep -qx "linha conhecida do B11" "$ENVS_DIR/111/output.log" \
+        || fail "log não contém a linha do script"
+    rm -f -- "$tmp"
+    [[ -f $ENVS_DIR/111/script.sh ]] || fail "cópia $ENVS_DIR/111/script.sh não existe"
+    echo "    command: $(tr '\n' ' ' < "$ENVS_DIR/111/command")"
+}
+
 test_B13() {
     fresh 113
     local -a c
@@ -227,11 +279,14 @@ declare -A DESC=(
     [B1]="comando que termina"
     [B2]="comando com erro"
     [B3]="serviço que não termina"
+    [B9]="namespace PID (e /proc sem vazar para a VM)"
+    [B10]="namespace UTS"
+    [B11]="script (executa a cópia)"
     [B13]="argumentos inválidos"
     [B14]="id duplicado"
     [B15]="não trava o chamador"
 )
-ALL=(B1 B2 B3 B13 B14 B15)
+ALL=(B1 B2 B3 B9 B10 B11 B13 B14 B15)
 
 TESTS=("$@")
 [[ ${#TESTS[@]} -eq 0 ]] && TESTS=("${ALL[@]}")

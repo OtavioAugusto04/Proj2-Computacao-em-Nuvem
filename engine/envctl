@@ -11,6 +11,10 @@ umask 022
 ENVS_DIR=/var/lib/envs
 CGROUP_ENVS=/sys/fs/cgroup/envs
 
+# Caminho absoluto deste próprio script: o create o usa para disparar a si
+# mesmo em background como "envctl _run ...".
+SELF=$(realpath -- "${BASH_SOURCE[0]}")
+
 # Códigos de saída (README 5.5)
 E_ARG=1        # argumento inválido
 E_NOTFOUND=2   # ambiente não existe
@@ -105,17 +109,27 @@ env_json() {
 
 # ---------------------------------------------------------------- execução
 
-# Processo intermediário de cada ambiente. Não é chamado diretamente: o create
-# o executa num bash novo, em background, numa sessão própria (setsid) e com
-# stdin/stdout/stderr já apontando para /dev/null e output.log.
-#   run_env <dir> <cgroup> <id> <programa...>
-run_env() {
-    local dir=$1 cg=$2 id=$3
-    shift 3
+# Subcomando interno "_run": é o processo intermediário de cada ambiente.
+# Não faz parte do contrato público. Só o create o chama, disparando o próprio
+# envctl em background (setsid, stdin em /dev/null, stdout/stderr no
+# output.log). O programa do usuário chega como argumentos separados.
+#   envctl _run <id> <programa...>
+cmd_run() {
+    [[ $# -ge 2 ]] || die $E_ARG "uso interno: envctl _run <id> <programa...>"
+    local id=$1
+    shift
+    require_id "$id"
+    local dir=$ENVS_DIR/$id cg=$CGROUP_ENVS/$id
+
+    # Proteção contra chamada à toa: o ambiente tem que ter sido preparado
+    # pelo create e ainda não pode ter sido iniciado.
+    [[ -d $dir ]] || die $E_NOTFOUND "ambiente $id não existe"
+    [[ -e $dir/pid || -e $dir/exit_code ]] && die $E_EXISTS "ambiente $id já foi iniciado"
+
     cd / || exit 1
 
-    # Entra no cgroup ANTES de rodar qualquer coisa do usuário: tudo o que
-    # este processo criar daqui em diante nasce dentro do cgroup.
+    # 1) Entra no cgroup ANTES de criar os namespaces: o unshare e tudo o que
+    #    nascer dentro dele herdam os limites deste cgroup.
     if ! echo $$ > "$cg/cgroup.procs"; then
         echo "[envctl] falha ao entrar no cgroup $cg"
         put "$dir/exit_code" 125
@@ -123,7 +137,19 @@ run_env() {
     fi
     put "$dir/pid" $$
 
-    "$@"
+    # 2) Cria os namespaces e roda o programa dentro deles:
+    #    --pid --fork   árvore de processos própria (o programa é o PID 1);
+    #    --mount-proc   namespace de mount novo com /proc próprio, sem vazar p/ a VM;
+    #    --uts          hostname próprio;  --ipc  IPC próprio.
+    #    O bash -c abaixo é texto fixo nosso: troca o hostname (já dentro do
+    #    UTS novo) e faz exec do programa. Os dados do usuário entram só como
+    #    argumentos posicionais ($1 = hostname, o resto = programa).
+    unshare --pid --fork --mount-proc --uts --ipc -- \
+        bash -c 'hostname "$1" || exit 125; shift; exec "$@"' env-init \
+        "env-$id" "$@"
+
+    # 3) O unshare --fork devolve o código de saída do processo filho, então
+    #    $? aqui é o código do programa do usuário.
     put "$dir/exit_code" $?
 }
 
@@ -169,18 +195,13 @@ cmd_create() {
     require_range --mem "$mem" 32 2048
     require_range --io  "$io"  1 500
 
-    # O programa vira um array de argumentos: o texto do usuário nunca é
-    # concatenado em outra linha de comando, vai inteiro como um único argumento.
-    local -a prog
     if [[ -n ${seen[--cmd]:-} && -n ${seen[--script]:-} ]]; then
         die $E_ARG "--cmd e --script são mutuamente exclusivos"
     elif [[ -n ${seen[--cmd]:-} ]]; then
         [[ -n $cmd ]] || die $E_ARG "--cmd não pode ser vazio"
-        prog=(bash -c "$cmd")
     elif [[ -n ${seen[--script]:-} ]]; then
         [[ -f $script && -r $script ]] || die $E_ARG "script não encontrado: $script"
         script=$(realpath -- "$script")
-        prog=(bash "$script")
     else
         die $E_ARG "informe --cmd ou --script"
     fi
@@ -202,21 +223,29 @@ cmd_create() {
     fi
     mkdir "$cg" || abort_create "$id" $E_INTERNAL "falha ao criar cgroup $cg"
 
+    # O programa vira um array de argumentos: o texto do usuário nunca é
+    # concatenado em outra linha de comando, vai inteiro como um único argumento.
+    local -a prog
     if [[ -n ${seen[--cmd]:-} ]]; then
+        prog=(bash -c "$cmd")
         printf '%s\n' "$cmd" > "$dir/command"
     else
-        printf 'script: %s\n' "$script" > "$dir/command"
+        # --script: o ambiente roda uma CÓPIA do script, guardada na pasta
+        # dele. Editar ou apagar o original depois não afeta o ambiente.
+        cp -- "$script" "$dir/script.sh" \
+            || abort_create "$id" $E_INTERNAL "falha ao copiar o script para $dir"
+        prog=(bash "$dir/script.sh")
+        printf 'bash %s\n# original: %s\n' "$dir/script.sh" "$script" > "$dir/command"
     fi
 
-    # Dispara o processo intermediário totalmente desacoplado do envctl:
+    # Dispara o próprio envctl em background, como "envctl _run <id> <programa>",
+    # totalmente desacoplado de quem chamou:
     #  - setsid: sessão nova, sem terminal de controle;
     #  - stdin de /dev/null e stdout/stderr no output.log: não fica com nenhuma
     #    ponta do pipe de quem chamou o envctl. Sem isso, o execFile do Node
     #    esperaria o pipe fechar, ou seja, o programa terminar.
-    # declare -f serializa a função run_env (código nosso); os dados do usuário
-    # entram só como argumentos posicionais ("$@"), nunca dentro da string.
-    setsid bash -c "$(declare -f put run_env); run_env \"\$@\"" run_env \
-        "$dir" "$cg" "$id" "${prog[@]}" \
+    # "bash $SELF" em vez de "$SELF": funciona mesmo sem o bit de execução.
+    setsid bash "$SELF" _run "$id" "${prog[@]}" \
         </dev/null >"$dir/output.log" 2>&1 &
     local runner=$!
 
@@ -252,6 +281,7 @@ main() {
     case $sub in
         create) cmd_create "$@" ;;
         status) cmd_status "$@" ;;
+        _run)   cmd_run "$@" ;;     # interno, de propósito fora da mensagem de uso
         *)      die $E_ARG "comando inválido: use create, status, list, logs, stop ou remove" ;;
     esac
 }
