@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Projeto 2 — Ambientes de Execução</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Ambientes de Execução</h1>
+    <nav class="tabs">
+      <button class="tab-btn active" data-view="environments">Ambientes</button>
+      <button class="tab-btn" data-view="new-environment">Novo ambiente</button>
+      <button class="tab-btn" data-view="scripts">Scripts</button>
+    </nav>
+  </header>
+
+  <main>
+    <div id="toast" class="toast hidden"></div>
+
+    <!-- Tela: lista de ambientes -->
+    <section id="view-environments" class="view active">
+      <div class="view-header">
+        <h2>Ambientes</h2>
+        <button id="refresh-environments" class="btn secondary">Atualizar</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Nome</th>
+            <th>CPU</th>
+            <th>Memória</th>
+            <th>IO</th>
+            <th>Status</th>
+            <th>Ações</th>
+          </tr>
+        </thead>
+        <tbody id="environments-body"></tbody>
+      </table>
+      <p id="environments-empty" class="empty hidden">Nenhum ambiente criado ainda.</p>
+    </section>
+
+    <!-- Tela: novo ambiente -->
+    <section id="view-new-environment" class="view">
+      <h2>Novo ambiente</h2>
+      <form id="form-new-environment" class="form">
+        <label>
+          Nome
+          <input type="text" name="name" required />
+        </label>
+
+        <div class="form-row">
+          <label>
+            CPU (% de um core, 1–100)
+            <input type="number" name="cpu_percent" min="1" max="100" value="50" required />
+          </label>
+          <label>
+            Memória (MB, 32–2048)
+            <input type="number" name="memory_mb" min="32" max="2048" value="256" required />
+          </label>
+          <label>
+            IO (MB/s, 1–500)
+            <input type="number" name="io_mbps" min="1" max="500" value="10" required />
+          </label>
+        </div>
+
+        <fieldset>
+          <legend>O que executar</legend>
+          <label class="radio">
+            <input type="radio" name="mode" value="cmd" checked /> Comando
+          </label>
+          <label class="radio">
+            <input type="radio" name="mode" value="script" /> Script salvo
+          </label>
+
+          <div id="mode-cmd-fields">
+            <label>
+              Comando
+              <textarea name="command" rows="3" placeholder="ex: while true; do date; sleep 1; done"></textarea>
+            </label>
+          </div>
+
+          <div id="mode-script-fields" class="hidden">
+            <label>
+              Script salvo
+              <select name="script_id"></select>
+            </label>
+          </div>
+        </fieldset>
+
+        <button type="submit" class="btn primary">Criar ambiente</button>
+      </form>
+    </section>
+
+    <!-- Tela: scripts -->
+    <section id="view-scripts" class="view">
+      <h2>Scripts salvos</h2>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Nome</th>
+            <th>Descrição</th>
+            <th>Criado em</th>
+            <th>Ações</th>
+          </tr>
+        </thead>
+        <tbody id="scripts-body"></tbody>
+      </table>
+      <p id="scripts-empty" class="empty hidden">Nenhum script salvo ainda.</p>
+
+      <h3>Enviar novo script</h3>
+      <form id="form-upload-script" class="form">
+        <label>
+          Nome
+          <input type="text" name="name" required />
+        </label>
+        <label>
+          Descrição
+          <input type="text" name="description" />
+        </label>
+        <label>
+          Arquivo (.sh, até 1 MB)
+          <input type="file" name="file" accept=".sh,text/x-sh,text/plain" required />
+        </label>
+        <button type="submit" class="btn primary">Enviar</button>
+      </form>
+    </section>
+
+    <!-- Tela: output de um ambiente -->
+    <section id="view-output" class="view">
+      <div class="view-header">
+        <h2>Output do ambiente <span id="output-env-id"></span></h2>
+        <button id="back-to-environments" class="btn secondary">Voltar</button>
+      </div>
+      <p>Status: <span id="output-status" class="status-badge"></span></p>
+      <pre id="output-log" class="log-box"></pre>
+    </section>
+  </main>
+
+  <script src="js/app.js"></script>
+</body>
+</html>

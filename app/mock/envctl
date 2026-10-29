@@ -1,0 +1,10 @@
+#!/bin/bash
+case "$1" in
+  create) echo "{\"id\": $2, \"pid\": $RANDOM, \"status\": \"running\", \"exit_code\": null}" ;;
+  status) echo "{\"id\": $2, \"pid\": 1234, \"status\": \"running\", \"exit_code\": null}" ;;
+  list)   echo '[{"id": 1, "pid": 1234, "status": "running", "exit_code": null}, {"id": 2, "pid": 1300, "status": "finished", "exit_code": 0}]' ;;
+  logs)   printf "linha 1 do output\nlinha 2 do output\n" ;;
+  stop)   echo "{\"id\": $2, \"pid\": null, \"status\": \"stopped\", \"exit_code\": null}" ;;
+  remove) echo "{\"id\": $2, \"removed\": true}" ;;
+  *)      echo '{"error": "comando invalido"}'; exit 1 ;;
+esac
