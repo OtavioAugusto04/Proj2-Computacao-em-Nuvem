@@ -4,6 +4,13 @@
 # Cria ambientes isolados, executa neles um comando ou script em background
 # e permite consultar e encerrar cada um. Interface e formato de saída seguem
 # o contrato do README (seções 5.4 e 5.5). Precisa rodar como root.
+#
+#   envctl create <id> --cpu <1-100> --mem <32-2048> --io <1-500> (--cmd <comando> | --script <caminho>)
+#   envctl status <id>
+#   envctl list
+#   envctl logs <id> [--tail <N>]
+#   envctl stop <id>
+#   envctl remove <id>
 
 set -u
 umask 022
@@ -26,6 +33,9 @@ E_EXISTS=3     # ambiente já existe
 E_INTERNAL=4   # falha interna (cgroup, permissão, disco)
 
 USAGE_CREATE='uso: envctl create <id> --cpu <1-100> --mem <32-2048> --io <1-500> (--cmd <comando> | --script <caminho>)'
+USAGE_LOGS='uso: envctl logs <id> [--tail <1-10000>]'
+
+STOP_TIMEOUT=50   # espera máxima pelo fim dos processos, em passos de 0,1 s (5 s)
 
 # ---------------------------------------------------------------- utilidades
 
@@ -64,9 +74,12 @@ int_or_null() {
 
 # <id> é inteiro positivo sem zeros à esquerda ("012" e "12" seriam pastas
 # diferentes para o mesmo id) e cabe num INT do MySQL.
+is_id() {
+    [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] && (( $1 <= 2147483647 ))
+}
+
 require_id() {
-    [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] && (( $1 <= 2147483647 )) \
-        || die $E_ARG "id inválido: deve ser um inteiro positivo"
+    is_id "$1" || die $E_ARG "id inválido: deve ser um inteiro positivo"
 }
 
 # require_range <opção> <valor> <min> <max>
@@ -210,6 +223,27 @@ set_limit() {
     echo "$3" 2>/dev/null > "$cg/$2" \
         || abort_create "$1" $E_INTERNAL "falha ao aplicar $2 = '$3' em $cg"
     printf '%s: %s\n' "$2" "$3" >> "$ENVS_DIR/$1/limits"
+}
+
+# ---------------------------------------------------------------- encerramento
+
+# kill_env <id>: mata todos os processos do ambiente e espera o cgroup.procs
+# esvaziar (até 5 s). Devolve 1 se não esvaziou. Usamos cgroup.kill, e não
+# kill <pid>, por dois motivos:
+#  - ele manda SIGKILL de uma vez para TODOS os processos do grupo, incluindo
+#    filhos e netos que o programa criou (um kill no pid os deixaria órfãos);
+#  - o programa é o PID 1 do seu namespace, e o kernel não entrega a um PID 1
+#    os sinais que ele não trata (SIGTERM, SIGINT...): um "while true" em bash
+#    simplesmente ignoraria. SIGKILL vindo de fora do namespace não é ignorável.
+kill_env() {
+    local cg=$CGROUP_ENVS/$1 i
+    [[ -n $(cat -- "$cg/cgroup.procs" 2>/dev/null) ]] || return 0
+    echo 1 2>/dev/null > "$cg/cgroup.kill" || return 1
+    for (( i = 0; i < STOP_TIMEOUT; i++ )); do
+        [[ -z $(cat -- "$cg/cgroup.procs" 2>/dev/null) ]] && return 0
+        sleep 0.1
+    done
+    return 1
 }
 
 # Desfaz o que o create já tinha criado e sai com erro.
@@ -357,6 +391,98 @@ cmd_status() {
     echo
 }
 
+# Array JSON com o objeto de status de cada ambiente, ordenado por id. Só
+# conta pastas cujo nome é um id válido: scripts/ e qualquer outra coisa em
+# /var/lib/envs ficam de fora.
+cmd_list() {
+    [[ $# -eq 0 ]] || die $E_ARG "uso: envctl list"
+    local d name id sep=''
+    local -a ids=()
+    for d in "$ENVS_DIR"/*/; do
+        name=${d%/}
+        name=${name##*/}
+        is_id "$name" && ids+=("$name")
+    done
+    # O glob ordena como texto ("100" antes de "99"); sort -n ordena como número.
+    printf '['
+    for id in $(printf '%s\n' "${ids[@]}" | sort -n); do
+        printf '%s' "$sep"
+        env_json "$id"
+        sep=', '
+    done
+    echo ']'
+}
+
+# Texto puro do output.log (sem JSON), inteiro ou só as últimas N linhas.
+# Erros continuam no formato do contrato. Log inexistente ou vazio não é
+# erro: o programa pode simplesmente não ter escrito nada.
+cmd_logs() {
+    [[ $# -eq 1 || $# -eq 3 ]] || die $E_ARG "$USAGE_LOGS"
+    local id=$1 n='' log
+    require_id "$id"
+    if [[ $# -eq 3 ]]; then
+        [[ $2 == --tail ]] || die $E_ARG "$USAGE_LOGS"
+        require_range --tail "$3" 1 10000
+        n=$(( 10#$3 ))
+    fi
+    require_env "$id"
+    log=$ENVS_DIR/$id/output.log
+    [[ -f $log ]] || return 0
+    if [[ -n $n ]]; then
+        tail -n "$n" -- "$log"
+    else
+        cat -- "$log"
+    fi || die $E_INTERNAL "falha ao ler $log"
+}
+
+cmd_stop() {
+    [[ $# -eq 1 ]] || die $E_ARG "uso: envctl stop <id>"
+    local id=$1 dir=$ENVS_DIR/$1
+    require_id "$id"
+    require_env "$id"
+
+    # Só um ambiente em execução é parado. Se já terminou (sozinho, com erro ou
+    # por um stop anterior), nada muda: quem terminou sozinho não vira "stopped".
+    if [[ $(env_status "$id") == running ]]; then
+        # "stopped" vem ANTES do kill: quem consultar durante o encerramento
+        # já vê stopped, e não "error" (cgroup vazio e sem exit_code).
+        put "$dir/stopped" "$(date '+%F %T')"
+        kill_env "$id" || die $E_INTERNAL "ambiente $id não encerrou em 5 s"
+        if [[ -e $dir/exit_code ]]; then
+            # O programa terminou sozinho entre a checagem e o kill: só assim o
+            # _run chega a gravar exit_code (o kill o mata junto). Desfaz o stopped.
+            rm -f -- "$dir/stopped"
+        else
+            # A linha vai DEPOIS do kill: enquanto o programa vive, ele escreve
+            # no log pelo seu próprio fd (sem append) e poderia sobrescrevê-la.
+            echo "[envctl] ambiente encerrado pelo usuário" >> "$dir/output.log"
+        fi
+    fi
+    env_json "$id"
+    echo
+}
+
+cmd_remove() {
+    [[ $# -eq 1 ]] || die $E_ARG "uso: envctl remove <id>"
+    local id=$1 cg=$CGROUP_ENVS/$1
+    require_id "$id"
+    require_env "$id"
+
+    # Igual ao stop, sem a linha no log (que vai ser apagado). kill_env roda
+    # sempre: se sobrou algum processo (ex.: um stop que estourou o tempo),
+    # ele é morto aqui também.
+    [[ $(env_status "$id") == running ]] && put "$ENVS_DIR/$id/stopped" "$(date '+%F %T')"
+    kill_env "$id" || die $E_INTERNAL "ambiente $id não encerrou em 5 s"
+
+    # Cgroup se apaga com rmdir (não rm -rf), e só depois de vazio. Se ele não
+    # existe (ex.: a VM reiniciou e /sys/fs/cgroup voltou vazio), não é erro.
+    if [[ -d $cg ]] && ! rmdir "$cg" 2>/dev/null; then
+        die $E_INTERNAL "falha ao remover o cgroup $cg"
+    fi
+    rm -rf -- "${ENVS_DIR:?}/$id" || die $E_INTERNAL "falha ao apagar $ENVS_DIR/$id"
+    printf '{"id": %s, "removed": true}\n' "$id"
+}
+
 main() {
     [[ $EUID -eq 0 ]] || die $E_INTERNAL "envctl precisa rodar como root"
     local sub=${1:-}
@@ -364,6 +490,10 @@ main() {
     case $sub in
         create) cmd_create "$@" ;;
         status) cmd_status "$@" ;;
+        list)   cmd_list "$@" ;;
+        logs)   cmd_logs "$@" ;;
+        stop)   cmd_stop "$@" ;;
+        remove) cmd_remove "$@" ;;
         _run)   cmd_run "$@" ;;     # interno, de propósito fora da mensagem de uso
         *)      die $E_ARG "comando inválido: use create, status, list, logs, stop ou remove" ;;
     esac

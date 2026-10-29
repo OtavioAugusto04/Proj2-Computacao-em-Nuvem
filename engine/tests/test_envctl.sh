@@ -3,7 +3,8 @@
 #   sudo bash tests/test_envctl.sh            # todos os testes
 #   sudo bash tests/test_envctl.sh B1 B3      # só os escolhidos
 # O caminho do motor pode ser trocado com ENVCTL=/caminho/envctl.
-# Todo ambiente criado aqui é removido ao final, mesmo se o teste falhar.
+# Cada teste tem seus ids; ao fim de cada um, os ambientes dele são apagados
+# com "envctl remove", mesmo se ele falhar. No fim, confere que nada sobrou.
 
 set -u
 
@@ -78,26 +79,19 @@ now_ms() {
     echo $(( $(date +%s%N) / 1000000 ))
 }
 
-# Remove um ambiente de teste. Usa o próprio envctl; enquanto o remove não
-# existir (etapas 1 a 3), faz a limpeza manualmente pelo cgroup.
+# Remove um ambiente de teste pelo próprio envctl. Exit 2 (não existe) é
+# normal: o teste pode ter falhado antes de criar, ou já ter removido.
 cleanup_env() {
-    local id=$1 cg=$CG_ENVS/$1 i
-    "$ENVCTL" remove "$id" >/dev/null 2>&1
-    case $? in 0|2) return ;; esac
-    if [[ -d $cg ]]; then
-        echo 1 > "$cg/cgroup.kill" 2>/dev/null
-        for (( i = 0; i < 50; i++ )); do
-            [[ -z $(cat "$cg/cgroup.procs" 2>/dev/null) ]] && break
-            sleep 0.1
-        done
-        rmdir "$cg" 2>/dev/null
-    fi
-    rm -rf -- "${ENVS_DIR:?}/$id"
+    "$ENVCTL" remove "$1" >/dev/null
+    case $? in
+        0|2) ;;
+        *) echo "    aviso: envctl remove $1 falhou" ;;
+    esac
 }
 
 USED_IDS=()
 # fresh <id>: garante que o id está livre (sobras de execuções anteriores) e o
-# registra para limpeza no final.
+# registra para limpeza no fim do teste.
 fresh() {
     cleanup_env "$1"
     USED_IDS+=("$1")
@@ -106,8 +100,36 @@ fresh() {
 cleanup_all() {
     local id
     for id in "${USED_IDS[@]}"; do cleanup_env "$id"; done
+    USED_IDS=()
 }
 trap cleanup_all EXIT
+
+# tree_pids <pid>: o pid e todos os seus descendentes.
+tree_pids() {
+    local p
+    echo "$1"
+    for p in $(ps -o pid= --ppid "$1"); do tree_pids "$p"; done
+}
+
+# still_alive <pids...>: imprime os que ainda existem.
+still_alive() {
+    local p
+    for p in "$@"; do [[ -e /proc/$p ]] && echo "$p"; done
+}
+
+# is_removed_json <id>: OUT é exatamente {"id": <id>, "removed": true}.
+is_removed_json() {
+    python3 -c '
+import json, sys
+sys.exit(0 if json.loads(sys.argv[1]) == {"id": int(sys.argv[2]), "removed": True} else 1)' "$OUT" "$1" 2>/dev/null
+}
+
+# list_summary: "id:status:exit_code ..." de cada item do array em OUT, na ordem.
+list_summary() {
+    python3 -c '
+import json, sys
+print(" ".join("%s:%s:%s" % (e["id"], e["status"], json.dumps(e["exit_code"])) for e in json.loads(sys.argv[1])))' "$OUT" 2>/dev/null
+}
 
 # ---------------------------------------------------------------- testes
 
@@ -150,6 +172,78 @@ test_B3() {
     run status 103
     expect "status depois de 4 s" "$(jget status)" running
     echo "    create em ${elapsed} ms; log ${size1} -> ${size2} bytes"
+}
+
+test_B4() {
+    fresh 104
+    fresh 140
+    fresh 999999
+    local log=$ENVS_DIR/104/output.log pids
+    run create 104 "${LIMITS[@]}" --cmd "while true; do date; sleep 1; done"
+    expect "código de saída do create" "$RC" 0
+    sleep 1.5
+    pids=$(tree_pids "$(jget pid)")
+    echo "    antes do stop: $(ps -o comm=,pid= -p "$(echo $pids | tr ' ' ,)" | awk '{ printf "%s(%s) ", $1, $2 }')"
+    run stop 104
+    expect "código de saída do stop" "$RC" 0
+    expect "status devolvido pelo stop" "$(jget status)" stopped
+    echo "    stop -> $OUT"
+    run status 104
+    expect "status depois do stop" "$(jget status)" stopped
+    [[ -z $(cat "$CG_ENVS/104/cgroup.procs") ]] || fail "cgroup.procs não está vazio"
+    [[ -z $(still_alive $pids) ]] || fail "processos ainda vivos: $(still_alive $pids | tr '\n' ' ')"
+    expect "última linha do log" "$(tail -n 1 "$log")" "[envctl] ambiente encerrado pelo usuário"
+    echo "    log termina com: $(tail -n 1 "$log")"
+    # Um segundo stop não muda nada nem repete a linha.
+    run stop 104
+    expect "segundo stop" "$(jget status)" stopped
+    expect "linhas do envctl no log" "$(grep -c '^\[envctl\]' "$log")" 1
+
+    # Ambiente que terminou sozinho: o stop não pode transformá-lo em stopped.
+    run create 140 "${LIMITS[@]}" --cmd "echo fim"
+    wait_done 140 5 || fail "não terminou em 5 s"
+    run stop 140
+    expect "código de saída do stop em finished" "$RC" 0
+    expect "status depois do stop em finished" "$(jget status)" finished
+    expect "exit_code depois do stop em finished" "$(jget exit_code)" 0
+    [[ -e $ENVS_DIR/140/stopped ]] && fail "stop criou 'stopped' num ambiente finished"
+    grep -q '^\[envctl\]' "$ENVS_DIR/140/output.log" && fail "stop escreveu no log de um ambiente finished"
+    echo "    stop em finished -> $OUT"
+
+    run stop 999999
+    expect "stop de id inexistente" "$RC" 2
+    is_error_json || fail "stop de id inexistente não devolveu {\"error\"}: $OUT"
+}
+
+test_B5() {
+    fresh 105
+    fresh 150
+    fresh 999999
+    local id pid before removed
+    run create 105 "${LIMITS[@]}" --cmd "while true; do date; sleep 1; done"
+    expect "código de saída do create 105" "$RC" 0
+    run create 150 "${LIMITS[@]}" --cmd "echo fim"
+    expect "código de saída do create 150" "$RC" 0
+    wait_done 150 5 || fail "150 não terminou em 5 s"
+    for id in 105 150; do
+        run status "$id"
+        before=$(jget status)
+        pid=$(jget pid)
+        run remove "$id"
+        removed=$OUT
+        expect "código de saída do remove $id" "$RC" 0
+        is_removed_json "$id" || fail "remove $id devolveu: $OUT"
+        [[ -e $ENVS_DIR/$id ]] && fail "pasta $ENVS_DIR/$id ainda existe"
+        [[ -e $CG_ENVS/$id ]] && fail "cgroup $CG_ENVS/$id ainda existe"
+        [[ -e /proc/$pid ]] && fail "pid $pid do ambiente $id ainda vivo"
+        run status "$id"
+        expect "status de $id depois do remove" "$RC" 2
+        is_error_json || fail "status depois do remove não devolveu {\"error\"}: $OUT"
+        echo "    $id ($before) -> $removed; status -> exit $RC $OUT"
+    done
+    run remove 999999
+    expect "remove de id inexistente" "$RC" 2
+    is_error_json || fail "remove de id inexistente não devolveu {\"error\"}: $OUT"
 }
 
 # cpu_usage <id>: tempo de CPU (µs) já consumido pelo cgroup do ambiente.
@@ -288,6 +382,77 @@ test_B11() {
     echo "    command: $(tr '\n' ' ' < "$ENVS_DIR/111/command")"
 }
 
+# Ids 98, 99 e 100 de propósito: em ordem de texto "100" viria antes de "98",
+# então o teste também prova que o list ordena como número.
+test_B12() {
+    local id tmp
+    local -a pids=()
+    for id in 98 99 100; do fresh "$id"; done
+    tmp=$(mktemp -d)
+    # Os três create disparados juntos, cada um com limites diferentes.
+    "$ENVCTL" create 98  --cpu 10 --mem 64  --io 5  --cmd "echo fim" > "$tmp/98" & pids+=($!)
+    "$ENVCTL" create 99  --cpu 30 --mem 128 --io 10 --cmd "exit 7" > "$tmp/99" & pids+=($!)
+    "$ENVCTL" create 100 --cpu 60 --mem 256 --io 20 --cmd "while true; do sleep 1; done" > "$tmp/100" & pids+=($!)
+    for id in "${pids[@]}"; do wait "$id" || fail "um dos create saiu com erro"; done
+    for id in 98 99 100; do echo "    create $id -> $(cat "$tmp/$id")"; done
+    rm -rf -- "$tmp"
+
+    wait_done 98 5 || fail "98 não terminou em 5 s"
+    wait_done 99 5 || fail "99 não terminou em 5 s"
+    run list
+    expect "código de saída do list" "$RC" 0
+    expect "list (id:status:exit_code)" "$(list_summary)" "98:finished:0 99:error:7 100:running:null"
+    echo "    list -> $OUT"
+    expect "cpu.max de 98"  "$(cat "$CG_ENVS/98/cpu.max")"  "10000 100000"
+    expect "cpu.max de 99"  "$(cat "$CG_ENVS/99/cpu.max")"  "30000 100000"
+    expect "cpu.max de 100" "$(cat "$CG_ENVS/100/cpu.max")" "60000 100000"
+    echo "    cpu.max: 98=$(cat "$CG_ENVS/98/cpu.max") 99=$(cat "$CG_ENVS/99/cpu.max") 100=$(cat "$CG_ENVS/100/cpu.max")"
+
+    for id in 98 99 100; do
+        run remove "$id"
+        is_removed_json "$id" || fail "remove $id devolveu: $OUT"
+    done
+    run list
+    expect "list depois de remover os 3" "$OUT" "[]"
+    echo "    list depois do remove -> $OUT"
+}
+
+test_LOGS() {
+    fresh 116
+    fresh 118
+    fresh 999999
+    local bad
+    run create 116 "${LIMITS[@]}" --cmd 'for i in 1 2 3 4 5; do echo "linha $i"; done'
+    expect "código de saída do create" "$RC" 0
+    wait_done 116 5 || fail "não terminou em 5 s"
+    run logs 116 --tail 2
+    expect "código de saída do logs --tail 2" "$RC" 0
+    expect "logs --tail 2" "$OUT" $'linha 4\nlinha 5'
+    echo "    logs --tail 2 -> $(echo "$OUT" | tr '\n' '|')"
+    run logs 116
+    expect "logs sem --tail" "$OUT" $'linha 1\nlinha 2\nlinha 3\nlinha 4\nlinha 5'
+    for bad in 0 abc 10001 -1 ''; do
+        run logs 116 --tail "$bad"
+        if [[ $RC -ne 1 ]] || ! is_error_json; then
+            fail "--tail '$bad': esperado exit 1 + {\"error\"}, obtido exit $RC: $OUT"
+        else
+            echo "    ok  --tail '$bad' -> $OUT"
+        fi
+    done
+    run logs 116 --tail
+    [[ $RC -eq 1 ]] && is_error_json || fail "--tail sem valor: exit $RC: $OUT"
+    run logs 999999
+    expect "logs de id inexistente" "$RC" 2
+    is_error_json || fail "logs de id inexistente não devolveu {\"error\"}: $OUT"
+    echo "    logs 999999 -> exit $RC $OUT"
+    # Programa que não escreve nada: saída vazia, sem erro.
+    run create 118 "${LIMITS[@]}" --cmd "true"
+    wait_done 118 5 || fail "118 não terminou em 5 s"
+    run logs 118
+    expect "código de saída do logs com log vazio" "$RC" 0
+    expect "logs com log vazio" "$OUT" ""
+}
+
 test_B13() {
     fresh 113
     local -a c
@@ -363,17 +528,21 @@ declare -A DESC=(
     [B1]="comando que termina"
     [B2]="comando com erro"
     [B3]="serviço que não termina"
+    [B4]="stop"
+    [B5]="remove"
     [B6]="limite de CPU"
     [B7]="limite de memória (OOM)"
     [B8]="limite de IO"
     [B9]="namespace PID (e /proc sem vazar para a VM)"
     [B10]="namespace UTS"
     [B11]="script (executa a cópia)"
+    [B12]="ambientes simultâneos e list"
     [B13]="argumentos inválidos"
     [B14]="id duplicado"
     [B15]="não trava o chamador"
+    [LOGS]="logs e --tail"
 )
-ALL=(B1 B2 B3 B6 B7 B8 B9 B10 B11 B13 B14 B15)
+ALL=(B1 B2 B3 B4 B5 B6 B7 B8 B9 B10 B11 B12 B13 B14 B15 LOGS)
 
 TESTS=("$@")
 [[ ${#TESTS[@]} -eq 0 ]] && TESTS=("${ALL[@]}")
@@ -388,6 +557,7 @@ for t in "${TESTS[@]}"; do
     echo "== $t: ${DESC[$t]}"
     T_OK=1
     "test_$t"
+    cleanup_all
     if (( T_OK )); then
         echo "PASS $t"
         PASSED+=("$t")
@@ -396,6 +566,12 @@ for t in "${TESTS[@]}"; do
         FAILED+=("$t")
     fi
 done
+
+# Nada pode sobrar: nem pasta de ambiente (nome = id) nem cgroup filho.
+LEFT=$(find "$ENVS_DIR" -mindepth 1 -maxdepth 1 -type d -regex '.*/[1-9][0-9]*' 2>/dev/null
+       find "$CG_ENVS" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
+echo "== sobras em $ENVS_DIR e $CG_ENVS: ${LEFT:-nenhuma}"
+[[ -z $LEFT ]] || FAILED+=(sobras)
 
 echo
 echo "Resumo: ${#PASSED[@]} PASS, ${#FAILED[@]} FAIL (de ${#TESTS[@]})"
