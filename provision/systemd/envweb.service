@@ -1,0 +1,13 @@
+[Unit]
+Description=Projeto 2 - Aplicacao web
+After=network.target mysql.service
+
+[Service]
+User=envweb
+WorkingDirectory=/opt/projeto2/app
+EnvironmentFile=/opt/projeto2/app/.env
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
