@@ -1,0 +1,26 @@
+# VM de desenvolvimento do motor (Parte B).
+#
+# NÃO é o Vagrantfile do projeto (esse fica na raiz e é da Parte A). Aqui só
+# existe o necessário para testar o envctl: Ubuntu 22.04 (cgroups v2) com a
+# pasta engine/ montada em /engine. Sem Apache, Node ou MySQL.
+#
+# Uso (a partir de engine/dev):
+#   vagrant up
+#   vagrant ssh -c "sudo bash /engine/tests/test_envctl.sh"
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64"
+  config.vm.hostname = "engine-dev"
+  config.vm.boot_timeout = 600
+
+  # Em vez do /vagrant padrão (que seria só engine/dev), monta engine/ inteira.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.synced_folder "..", "/engine"
+
+  config.vm.provider "virtualbox" do |vb|
+    vb.name = "projeto2-engine-dev"
+    vb.cpus = 1
+    vb.memory = 4096
+    vb.gui = false
+  end
+end
