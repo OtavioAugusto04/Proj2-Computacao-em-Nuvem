@@ -1,0 +1,372 @@
+#!/bin/bash
+# envctl — motor de execução do Projeto 2 (Parte B).
+#
+# Cria ambientes isolados, executa neles um comando ou script em background
+# e permite consultar e encerrar cada um. Interface e formato de saída seguem
+# o contrato do README (seções 5.4 e 5.5). Precisa rodar como root.
+
+set -u
+umask 022
+
+ENVS_DIR=/var/lib/envs
+CGROUP_ROOT=/sys/fs/cgroup
+CGROUP_ENVS=$CGROUP_ROOT/envs
+
+CPU_PERIOD=100000   # período do cpu.max, em µs (100 ms)
+MIB=1048576         # 1 MB (MiB) em bytes, para --mem e --io
+
+# Caminho absoluto deste próprio script: o create o usa para disparar a si
+# mesmo em background como "envctl _run ...".
+SELF=$(realpath -- "${BASH_SOURCE[0]}")
+
+# Códigos de saída (README 5.5)
+E_ARG=1        # argumento inválido
+E_NOTFOUND=2   # ambiente não existe
+E_EXISTS=3     # ambiente já existe
+E_INTERNAL=4   # falha interna (cgroup, permissão, disco)
+
+USAGE_CREATE='uso: envctl create <id> --cpu <1-100> --mem <32-2048> --io <1-500> (--cmd <comando> | --script <caminho>)'
+
+# ---------------------------------------------------------------- utilidades
+
+# Escapa uma string para ir entre aspas num JSON. Necessário porque mensagens
+# de erro podem conter texto vindo do usuário (ex.: uma opção desconhecida).
+json_str() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    s=${s//[[:cntrl:]]/ }   # qualquer outro caractere de controle é inválido em JSON
+    printf '%s' "$s"
+}
+
+# die <código> <mensagem>: erro no formato do contrato, no stdout.
+die() {
+    printf '{"error": "%s"}\n' "$(json_str "$2")"
+    exit "$1"
+}
+
+# Grava um valor de forma atômica (tmp + mv): quem lê nunca vê o arquivo pela metade.
+put() {
+    printf '%s\n' "$2" > "$1.tmp" && mv -f -- "$1.tmp" "$1"
+}
+
+# Imprime o inteiro contido no arquivo, ou null se o arquivo não existe/é inválido.
+int_or_null() {
+    local v
+    v=$(cat -- "$1" 2>/dev/null)
+    if [[ $v =~ ^-?[0-9]+$ ]]; then echo "$v"; else echo null; fi
+}
+
+# ---------------------------------------------------------------- validação
+
+# <id> é inteiro positivo sem zeros à esquerda ("012" e "12" seriam pastas
+# diferentes para o mesmo id) e cabe num INT do MySQL.
+require_id() {
+    [[ $1 =~ ^[1-9][0-9]{0,9}$ ]] && (( $1 <= 2147483647 )) \
+        || die $E_ARG "id inválido: deve ser um inteiro positivo"
+}
+
+# require_range <opção> <valor> <min> <max>
+# O limite de 6 dígitos evita estouro na aritmética do bash; 10# força base
+# decimal (sem ele, "010" seria lido como octal).
+require_range() {
+    [[ $2 =~ ^[0-9]{1,6}$ ]] && (( 10#$2 >= $3 && 10#$2 <= $4 )) \
+        || die $E_ARG "$1 deve ser um inteiro entre $3 e $4"
+}
+
+require_env() {
+    [[ -d $ENVS_DIR/$1 ]] || die $E_NOTFOUND "ambiente $1 não existe"
+}
+
+# ---------------------------------------------------------------- status
+
+# Status de um ambiente existente, na ordem do README 7.4.
+env_status() {
+    local dir=$ENVS_DIR/$1 cg=$CGROUP_ENVS/$1 procs code
+
+    [[ -e $dir/stopped ]] && { echo stopped; return; }
+
+    # Arquivos do cgroup sempre têm tamanho 0 no stat, então é preciso ler o
+    # conteúdo. Se o cgroup não existe (ex.: VM reiniciada), conta como vazio.
+    procs=$(cat -- "$cg/cgroup.procs" 2>/dev/null)
+    [[ -n $procs ]] && { echo running; return; }
+
+    code=$(int_or_null "$dir/exit_code")
+    if [[ $code == 0 ]]; then
+        echo finished
+    else
+        # código ≠ 0, ou nenhum exit_code: o processo foi morto antes de poder
+        # gravá-lo (ex.: OOM) ou falhou ao iniciar.
+        echo error
+    fi
+}
+
+# Objeto JSON de um ambiente: {"id", "pid", "status", "exit_code"}.
+env_json() {
+    local dir=$ENVS_DIR/$1
+    printf '{"id": %s, "pid": %s, "status": "%s", "exit_code": %s}' \
+        "$1" "$(int_or_null "$dir/pid")" "$(env_status "$1")" "$(int_or_null "$dir/exit_code")"
+}
+
+# ---------------------------------------------------------------- execução
+
+# Subcomando interno "_run": é o processo intermediário de cada ambiente.
+# Não faz parte do contrato público. Só o create o chama, disparando o próprio
+# envctl em background (setsid, stdin em /dev/null, stdout/stderr no
+# output.log). O programa do usuário chega como argumentos separados.
+#   envctl _run <id> <programa...>
+cmd_run() {
+    [[ $# -ge 2 ]] || die $E_ARG "uso interno: envctl _run <id> <programa...>"
+    local id=$1
+    shift
+    require_id "$id"
+    local dir=$ENVS_DIR/$id cg=$CGROUP_ENVS/$id
+
+    # Proteção contra chamada à toa: o ambiente tem que ter sido preparado
+    # pelo create e ainda não pode ter sido iniciado.
+    [[ -d $dir ]] || die $E_NOTFOUND "ambiente $id não existe"
+    [[ -e $dir/pid || -e $dir/exit_code ]] && die $E_EXISTS "ambiente $id já foi iniciado"
+
+    cd / || exit 1
+
+    # 1) Entra no cgroup ANTES de criar os namespaces: o unshare e tudo o que
+    #    nascer dentro dele herdam os limites deste cgroup.
+    if ! echo $$ > "$cg/cgroup.procs"; then
+        echo "[envctl] falha ao entrar no cgroup $cg"
+        put "$dir/exit_code" 125
+        exit 125
+    fi
+    put "$dir/pid" $$
+
+    # 2) Cria os namespaces e roda o programa dentro deles:
+    #    --pid --fork   árvore de processos própria (o programa é o PID 1);
+    #    --mount-proc   namespace de mount novo com /proc próprio, sem vazar p/ a VM;
+    #    --uts          hostname próprio;  --ipc  IPC próprio.
+    #    O bash -c abaixo é texto fixo nosso: troca o hostname (já dentro do
+    #    UTS novo) e faz exec do programa. Os dados do usuário entram só como
+    #    argumentos posicionais ($1 = hostname, o resto = programa).
+    #    Durante o unshare, o stderr DESTE shell vai para /dev/null (guardado
+    #    no fd 3) e o do programa continua no output.log. Sem isso, se o
+    #    programa morre por sinal (ex.: OOM), o bash escreve no log do usuário
+    #    um aviso "line N: PID Killed unshare ..." com código interno nosso.
+    exec 3>&2 2>/dev/null
+    unshare --pid --fork --mount-proc --uts --ipc -- \
+        bash -c 'hostname "$1" || exit 125; shift; exec "$@"' env-init \
+        "env-$id" "$@" 2>&3 3>&-
+
+    # 3) O unshare --fork devolve o código de saída do processo filho, então
+    #    $? aqui é o código do programa do usuário. Se o filho morreu por um
+    #    sinal, o unshare se mata com o mesmo sinal e $? vira 128 + sinal
+    #    (ex.: 137 = SIGKILL, que é o que o OOM killer manda).
+    local rc=$?
+    exec 2>&3 3>&-
+
+    # 4) Se o kernel matou algum processo do grupo por estourar o memory.max,
+    #    o contador oom_kill do memory.events é > 0. Registra no log, para o
+    #    usuário saber por que deu erro; o status continua "error" pelo código.
+    local ooms bytes
+    ooms=$(awk '$1 == "oom_kill" { print $2 }' "$cg/memory.events" 2>/dev/null)
+    if [[ $ooms =~ ^[0-9]+$ ]] && (( ooms > 0 )); then
+        bytes=$(cat -- "$cg/memory.max" 2>/dev/null)
+        echo "[envctl] processo encerrado por exceder o limite de memória ($(( bytes / MIB )) MB)"
+    fi
+
+    put "$dir/exit_code" $rc
+}
+
+# ---------------------------------------------------------------- limites
+
+# enable_controllers <subtree_control>: garante que cpu, memory e io estão
+# habilitados para os filhos desse cgroup. Só escreve os que faltam, então
+# pode rodar a cada create sem efeito colateral.
+enable_controllers() {
+    local f=$1 have c
+    have=" $(cat -- "$f" 2>/dev/null) "
+    for c in cpu memory io; do
+        [[ $have == *" $c "* ]] && continue
+        echo "+$c" 2>/dev/null > "$f" || return 1
+    done
+}
+
+# MAJ:MIN do disco em que está a raiz (/). O io.max só aceita o disco inteiro,
+# não uma partição: de /dev/sda1 sobe para o pai (PKNAME), /dev/sda. Se a raiz
+# não tem pai, ela já é o disco inteiro e o próprio dispositivo serve.
+root_disk() {
+    local dev parent
+    dev=$(findmnt -no SOURCE /) || return 1
+    parent=$(lsblk -dno PKNAME -- "$dev" 2>/dev/null)
+    [[ -n $parent ]] && dev=/dev/$parent
+    lsblk -dno MAJ:MIN -- "$dev" 2>/dev/null | tr -d ' '
+}
+
+# set_limit <id> <arquivo> <valor>: grava o valor no arquivo do cgroup do
+# ambiente e anota em <dir>/limits. Se o kernel recusar, o ambiente não é
+# criado: nunca roda nada sem os limites aplicados.
+set_limit() {
+    local cg=$CGROUP_ENVS/$1
+    echo "$3" 2>/dev/null > "$cg/$2" \
+        || abort_create "$1" $E_INTERNAL "falha ao aplicar $2 = '$3' em $cg"
+    printf '%s: %s\n' "$2" "$3" >> "$ENVS_DIR/$1/limits"
+}
+
+# Desfaz o que o create já tinha criado e sai com erro.
+#   abort_create <id> <código> <mensagem>
+abort_create() {
+    rmdir "$CGROUP_ENVS/$1" 2>/dev/null
+    rm -rf -- "${ENVS_DIR:?}/$1"
+    die "$2" "$3"
+}
+
+# ---------------------------------------------------------------- comandos
+
+cmd_create() {
+    [[ $# -ge 1 ]] || die $E_ARG "$USAGE_CREATE"
+    local id=$1
+    shift
+    require_id "$id"
+
+    local cpu='' mem='' io='' cmd='' script=''
+    local -A seen=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --cpu|--mem|--io|--cmd|--script) ;;
+            *) die $E_ARG "opção desconhecida: $1" ;;
+        esac
+        [[ $# -ge 2 ]] || die $E_ARG "opção $1 sem valor"
+        [[ -z ${seen[$1]:-} ]] || die $E_ARG "opção $1 repetida"
+        seen[$1]=1
+        case $1 in
+            --cpu)    cpu=$2 ;;
+            --mem)    mem=$2 ;;
+            --io)     io=$2 ;;
+            --cmd)    cmd=$2 ;;
+            --script) script=$2 ;;
+        esac
+        shift 2
+    done
+
+    [[ -n ${seen[--cpu]:-} && -n ${seen[--mem]:-} && -n ${seen[--io]:-} ]] \
+        || die $E_ARG "--cpu, --mem e --io são obrigatórios. $USAGE_CREATE"
+    require_range --cpu "$cpu" 1 100
+    require_range --mem "$mem" 32 2048
+    require_range --io  "$io"  1 500
+
+    if [[ -n ${seen[--cmd]:-} && -n ${seen[--script]:-} ]]; then
+        die $E_ARG "--cmd e --script são mutuamente exclusivos"
+    elif [[ -n ${seen[--cmd]:-} ]]; then
+        [[ -n $cmd ]] || die $E_ARG "--cmd não pode ser vazio"
+    elif [[ -n ${seen[--script]:-} ]]; then
+        [[ -f $script && -r $script ]] || die $E_ARG "script não encontrado: $script"
+        script=$(realpath -- "$script")
+    else
+        die $E_ARG "informe --cmd ou --script"
+    fi
+
+    local dir=$ENVS_DIR/$id cg=$CGROUP_ENVS/$id
+    mkdir -p "$ENVS_DIR" || die $E_INTERNAL "falha ao criar $ENVS_DIR"
+    # mkdir sem -p é atômico: se dois creates com o mesmo id rodarem ao mesmo
+    # tempo, só um consegue criar a pasta.
+    if ! mkdir "$dir" 2>/dev/null; then
+        [[ -e $dir ]] && die $E_EXISTS "ambiente $id já existe"
+        die $E_INTERNAL "falha ao criar $dir"
+    fi
+
+    # Cgroup do ambiente. Se sobrou um cgroup vazio com esse id (ex.: pasta
+    # apagada à mão), rmdir o limpa; se ainda tiver processos, rmdir falha.
+    mkdir -p "$CGROUP_ENVS" || abort_create "$id" $E_INTERNAL "falha ao criar $CGROUP_ENVS"
+    if [[ -d $cg ]] && ! rmdir "$cg" 2>/dev/null; then
+        abort_create "$id" $E_EXISTS "cgroup $cg já existe e está em uso"
+    fi
+    mkdir "$cg" || abort_create "$id" $E_INTERNAL "falha ao criar cgroup $cg"
+
+    # Limites de recurso, todos gravados ANTES de o _run existir: o programa
+    # já nasce limitado. Para o cgroup do ambiente ter os arquivos cpu.*,
+    # memory.* e io.*, os controladores precisam estar habilitados na raiz e
+    # em envs/ (no cgroup v2, cada nível delega ao de baixo).
+    enable_controllers "$CGROUP_ROOT/cgroup.subtree_control" \
+        && enable_controllers "$CGROUP_ENVS/cgroup.subtree_control" \
+        || abort_create "$id" $E_INTERNAL "falha ao habilitar os controladores cpu, memory e io em $CGROUP_ENVS"
+    local disk
+    disk=$(root_disk)
+    [[ $disk =~ ^[0-9]+:[0-9]+$ ]] \
+        || abort_create "$id" $E_INTERNAL "não foi possível descobrir o disco da raiz para o io.max"
+
+    # CPU: "<quota> <período>" = a cada 100 ms, o grupo usa no máximo
+    # cpu% desse tempo. --cpu 50 → "50000 100000". A VM tem 1 CPU, então
+    # 100% é a VM inteira.
+    set_limit "$id" cpu.max "$(( CPU_PERIOD * 10#$cpu / 100 )) $CPU_PERIOD"
+    # Memória: teto em bytes. Passou disso, o kernel tenta liberar cache e,
+    # se não conseguir, o OOM killer mata o processo do grupo.
+    set_limit "$id" memory.max "$(( 10#$mem * MIB ))"
+    # Swap zero: sem isso, o excesso iria para o swap e o limite não barraria.
+    set_limit "$id" memory.swap.max 0
+    # Disco: leitura (rbps) e escrita (wbps) em bytes/s no disco da raiz.
+    set_limit "$id" io.max "$disk rbps=$(( 10#$io * MIB )) wbps=$(( 10#$io * MIB ))"
+
+    # O programa vira um array de argumentos: o texto do usuário nunca é
+    # concatenado em outra linha de comando, vai inteiro como um único argumento.
+    local -a prog
+    if [[ -n ${seen[--cmd]:-} ]]; then
+        prog=(bash -c "$cmd")
+        printf '%s\n' "$cmd" > "$dir/command"
+    else
+        # --script: o ambiente roda uma CÓPIA do script, guardada na pasta
+        # dele. Editar ou apagar o original depois não afeta o ambiente.
+        cp -- "$script" "$dir/script.sh" \
+            || abort_create "$id" $E_INTERNAL "falha ao copiar o script para $dir"
+        prog=(bash "$dir/script.sh")
+        printf 'bash %s\n# original: %s\n' "$dir/script.sh" "$script" > "$dir/command"
+    fi
+
+    # Dispara o próprio envctl em background, como "envctl _run <id> <programa>",
+    # totalmente desacoplado de quem chamou:
+    #  - setsid: sessão nova, sem terminal de controle;
+    #  - stdin de /dev/null e stdout/stderr no output.log: não fica com nenhuma
+    #    ponta do pipe de quem chamou o envctl. Sem isso, o execFile do Node
+    #    esperaria o pipe fechar, ou seja, o programa terminar.
+    # "bash $SELF" em vez de "$SELF": funciona mesmo sem o bit de execução.
+    setsid bash "$SELF" _run "$id" "${prog[@]}" \
+        </dev/null >"$dir/output.log" 2>&1 &
+    local runner=$!
+
+    # Espera o intermediário entrar no cgroup e gravar o pid (ou falhar e
+    # gravar exit_code). Leva milissegundos; sem essa espera, o status
+    # calculado abaixo poderia sair "error" só porque o cgroup ainda está vazio.
+    local i
+    for (( i = 0; i < 500; i++ )); do
+        [[ -e $dir/pid || -e $dir/exit_code ]] && break
+        sleep 0.01
+    done
+    if [[ ! -e $dir/pid && ! -e $dir/exit_code ]]; then
+        kill -9 "$runner" 2>/dev/null
+        abort_create "$id" $E_INTERNAL "o processo do ambiente não iniciou"
+    fi
+
+    env_json "$id"
+    echo
+}
+
+cmd_status() {
+    [[ $# -eq 1 ]] || die $E_ARG "uso: envctl status <id>"
+    require_id "$1"
+    require_env "$1"
+    env_json "$1"
+    echo
+}
+
+main() {
+    [[ $EUID -eq 0 ]] || die $E_INTERNAL "envctl precisa rodar como root"
+    local sub=${1:-}
+    [[ $# -gt 0 ]] && shift
+    case $sub in
+        create) cmd_create "$@" ;;
+        status) cmd_status "$@" ;;
+        _run)   cmd_run "$@" ;;     # interno, de propósito fora da mensagem de uso
+        *)      die $E_ARG "comando inválido: use create, status, list, logs, stop ou remove" ;;
+    esac
+}
+
+main "$@"
