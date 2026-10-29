@@ -9,7 +9,11 @@ set -u
 umask 022
 
 ENVS_DIR=/var/lib/envs
-CGROUP_ENVS=/sys/fs/cgroup/envs
+CGROUP_ROOT=/sys/fs/cgroup
+CGROUP_ENVS=$CGROUP_ROOT/envs
+
+CPU_PERIOD=100000   # período do cpu.max, em µs (100 ms)
+MIB=1048576         # 1 MB (MiB) em bytes, para --mem e --io
 
 # Caminho absoluto deste próprio script: o create o usa para disparar a si
 # mesmo em background como "envctl _run ...".
@@ -144,13 +148,68 @@ cmd_run() {
     #    O bash -c abaixo é texto fixo nosso: troca o hostname (já dentro do
     #    UTS novo) e faz exec do programa. Os dados do usuário entram só como
     #    argumentos posicionais ($1 = hostname, o resto = programa).
+    #    Durante o unshare, o stderr DESTE shell vai para /dev/null (guardado
+    #    no fd 3) e o do programa continua no output.log. Sem isso, se o
+    #    programa morre por sinal (ex.: OOM), o bash escreve no log do usuário
+    #    um aviso "line N: PID Killed unshare ..." com código interno nosso.
+    exec 3>&2 2>/dev/null
     unshare --pid --fork --mount-proc --uts --ipc -- \
         bash -c 'hostname "$1" || exit 125; shift; exec "$@"' env-init \
-        "env-$id" "$@"
+        "env-$id" "$@" 2>&3 3>&-
 
     # 3) O unshare --fork devolve o código de saída do processo filho, então
-    #    $? aqui é o código do programa do usuário.
-    put "$dir/exit_code" $?
+    #    $? aqui é o código do programa do usuário. Se o filho morreu por um
+    #    sinal, o unshare se mata com o mesmo sinal e $? vira 128 + sinal
+    #    (ex.: 137 = SIGKILL, que é o que o OOM killer manda).
+    local rc=$?
+    exec 2>&3 3>&-
+
+    # 4) Se o kernel matou algum processo do grupo por estourar o memory.max,
+    #    o contador oom_kill do memory.events é > 0. Registra no log, para o
+    #    usuário saber por que deu erro; o status continua "error" pelo código.
+    local ooms bytes
+    ooms=$(awk '$1 == "oom_kill" { print $2 }' "$cg/memory.events" 2>/dev/null)
+    if [[ $ooms =~ ^[0-9]+$ ]] && (( ooms > 0 )); then
+        bytes=$(cat -- "$cg/memory.max" 2>/dev/null)
+        echo "[envctl] processo encerrado por exceder o limite de memória ($(( bytes / MIB )) MB)"
+    fi
+
+    put "$dir/exit_code" $rc
+}
+
+# ---------------------------------------------------------------- limites
+
+# enable_controllers <subtree_control>: garante que cpu, memory e io estão
+# habilitados para os filhos desse cgroup. Só escreve os que faltam, então
+# pode rodar a cada create sem efeito colateral.
+enable_controllers() {
+    local f=$1 have c
+    have=" $(cat -- "$f" 2>/dev/null) "
+    for c in cpu memory io; do
+        [[ $have == *" $c "* ]] && continue
+        echo "+$c" 2>/dev/null > "$f" || return 1
+    done
+}
+
+# MAJ:MIN do disco em que está a raiz (/). O io.max só aceita o disco inteiro,
+# não uma partição: de /dev/sda1 sobe para o pai (PKNAME), /dev/sda. Se a raiz
+# não tem pai, ela já é o disco inteiro e o próprio dispositivo serve.
+root_disk() {
+    local dev parent
+    dev=$(findmnt -no SOURCE /) || return 1
+    parent=$(lsblk -dno PKNAME -- "$dev" 2>/dev/null)
+    [[ -n $parent ]] && dev=/dev/$parent
+    lsblk -dno MAJ:MIN -- "$dev" 2>/dev/null | tr -d ' '
+}
+
+# set_limit <id> <arquivo> <valor>: grava o valor no arquivo do cgroup do
+# ambiente e anota em <dir>/limits. Se o kernel recusar, o ambiente não é
+# criado: nunca roda nada sem os limites aplicados.
+set_limit() {
+    local cg=$CGROUP_ENVS/$1
+    echo "$3" 2>/dev/null > "$cg/$2" \
+        || abort_create "$1" $E_INTERNAL "falha ao aplicar $2 = '$3' em $cg"
+    printf '%s: %s\n' "$2" "$3" >> "$ENVS_DIR/$1/limits"
 }
 
 # Desfaz o que o create já tinha criado e sai com erro.
@@ -222,6 +281,30 @@ cmd_create() {
         abort_create "$id" $E_EXISTS "cgroup $cg já existe e está em uso"
     fi
     mkdir "$cg" || abort_create "$id" $E_INTERNAL "falha ao criar cgroup $cg"
+
+    # Limites de recurso, todos gravados ANTES de o _run existir: o programa
+    # já nasce limitado. Para o cgroup do ambiente ter os arquivos cpu.*,
+    # memory.* e io.*, os controladores precisam estar habilitados na raiz e
+    # em envs/ (no cgroup v2, cada nível delega ao de baixo).
+    enable_controllers "$CGROUP_ROOT/cgroup.subtree_control" \
+        && enable_controllers "$CGROUP_ENVS/cgroup.subtree_control" \
+        || abort_create "$id" $E_INTERNAL "falha ao habilitar os controladores cpu, memory e io em $CGROUP_ENVS"
+    local disk
+    disk=$(root_disk)
+    [[ $disk =~ ^[0-9]+:[0-9]+$ ]] \
+        || abort_create "$id" $E_INTERNAL "não foi possível descobrir o disco da raiz para o io.max"
+
+    # CPU: "<quota> <período>" = a cada 100 ms, o grupo usa no máximo
+    # cpu% desse tempo. --cpu 50 → "50000 100000". A VM tem 1 CPU, então
+    # 100% é a VM inteira.
+    set_limit "$id" cpu.max "$(( CPU_PERIOD * 10#$cpu / 100 )) $CPU_PERIOD"
+    # Memória: teto em bytes. Passou disso, o kernel tenta liberar cache e,
+    # se não conseguir, o OOM killer mata o processo do grupo.
+    set_limit "$id" memory.max "$(( 10#$mem * MIB ))"
+    # Swap zero: sem isso, o excesso iria para o swap e o limite não barraria.
+    set_limit "$id" memory.swap.max 0
+    # Disco: leitura (rbps) e escrita (wbps) em bytes/s no disco da raiz.
+    set_limit "$id" io.max "$disk rbps=$(( 10#$io * MIB )) wbps=$(( 10#$io * MIB ))"
 
     # O programa vira um array de argumentos: o texto do usuário nunca é
     # concatenado em outra linha de comando, vai inteiro como um único argumento.

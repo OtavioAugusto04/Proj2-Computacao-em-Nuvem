@@ -152,6 +152,90 @@ test_B3() {
     echo "    create em ${elapsed} ms; log ${size1} -> ${size2} bytes"
 }
 
+# cpu_usage <id>: tempo de CPU (µs) já consumido pelo cgroup do ambiente.
+cpu_usage() {
+    awk '$1 == "usage_usec" { print $2 }' "$CG_ENVS/$1/cpu.stat"
+}
+
+# in_range <valor> <min> <max>: comparação com decimais (o bash só faz inteiros).
+in_range() {
+    awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v != "" && v >= lo && v <= hi) }'
+}
+
+test_B6() {
+    fresh 106
+    local u1 u2 t1 t2 pct
+    run create 106 --cpu 20 --mem 128 --io 10 --cmd "yes > /dev/null"
+    expect "código de saída do create" "$RC" 0
+    expect "cpu.max" "$(cat "$CG_ENVS/106/cpu.max")" "20000 100000"
+    sleep 0.5
+    u1=$(cpu_usage 106); t1=$(date +%s%N)
+    sleep 3
+    u2=$(cpu_usage 106); t2=$(date +%s%N)
+    # µs de CPU usados pelo grupo / µs de relógio que passaram
+    pct=$(awk -v du=$(( u2 - u1 )) -v dt=$(( (t2 - t1) / 1000 )) \
+        'BEGIN { printf "%.1f", 100 * du / dt }')
+    in_range "$pct" 15 25 || fail "uso de CPU fora de 15–25%: ${pct}%"
+    run status 106
+    expect "status" "$(jget status)" running
+    echo "    cpu.max: $(cat "$CG_ENVS/106/cpu.max"); uso medido: ${pct}% em $(( (t2 - t1) / 1000000 )) ms"
+}
+
+# alloc_cmd <MB>: comando python que aloca e preenche <MB> megabytes. Precisa
+# escrever na memória (b"x" * n): só reservar não conta para o cgroup.
+alloc_cmd() {
+    printf "python3 -c 'import sys; b = b\"x\" * (int(sys.argv[1]) << 20); print(\"alocou\", sys.argv[1], \"MB\")' %s" "$1"
+}
+
+test_B7() {
+    fresh 107
+    fresh 117
+    local log=$ENVS_DIR/107/output.log oom
+    # Excesso: 200 MB num limite de 64 MB.
+    run create 107 --cpu 50 --mem 64 --io 10 --cmd "$(alloc_cmd 200)"
+    expect "código de saída do create" "$RC" 0
+    expect "memory.max" "$(cat "$CG_ENVS/107/memory.max")" 67108864
+    expect "memory.swap.max" "$(cat "$CG_ENVS/107/memory.swap.max")" 0
+    wait_done 107 15 || fail "não terminou em 15 s"
+    expect "status com 200 MB" "$(jget status)" error
+    oom=$(awk '$1 == "oom_kill" { print $2 }' "$CG_ENVS/107/memory.events")
+    (( ${oom:-0} >= 1 )) || fail "memory.events sem oom_kill: $(tr '\n' ' ' < "$CG_ENVS/107/memory.events")"
+    grep -qxF "[envctl] processo encerrado por exceder o limite de memória (64 MB)" "$log" \
+        || fail "output.log sem a mensagem de OOM do envctl"
+    grep -q alocou "$log" && fail "conseguiu alocar 200 MB com limite de 64 MB"
+    echo "    200 MB: status $(jget status), exit_code $(jget exit_code), oom_kill $oom"
+    sed 's/^/    | /' "$log"
+
+    # Controle positivo: 20 MB cabem em 64 MB, então o limite não pode atrapalhar.
+    run create 117 --cpu 50 --mem 64 --io 10 --cmd "$(alloc_cmd 20)"
+    expect "código de saída do create" "$RC" 0
+    wait_done 117 15 || fail "não terminou em 15 s"
+    expect "status com 20 MB" "$(jget status)" finished
+    expect "exit_code com 20 MB" "$(jget exit_code)" 0
+    grep -qx "alocou 20 MB" "$ENVS_DIR/117/output.log" || fail "output.log sem 'alocou 20 MB'"
+    echo "    20 MB: status $(jget status), exit_code $(jget exit_code)"
+}
+
+test_B8() {
+    fresh 108
+    local dst=$ENVS_DIR/108/dd.bin log=$ENVS_DIR/108/output.log line rate
+    run create 108 --cpu 50 --mem 128 --io 5 \
+        --cmd "dd if=/dev/zero of=$dst bs=1M count=25 oflag=direct"
+    expect "código de saída do create" "$RC" 0
+    # O destino precisa estar no disco limitado pelo io.max, não em memória.
+    [[ $(findmnt -no FSTYPE -T "$ENVS_DIR/108") == tmpfs ]] && fail "destino do dd está em tmpfs"
+    echo "    destino: $(findmnt -no TARGET,SOURCE,FSTYPE -T "$ENVS_DIR/108")"
+    echo "    io.max: $(cat "$CG_ENVS/108/io.max")"
+    wait_done 108 20 || fail "não terminou em 20 s"
+    expect "status" "$(jget status)" finished
+    line=$(grep copied "$log")
+    echo "    dd: $line"
+    rate=$(sed -nE 's#.*, ([0-9.]+) MB/s$#\1#p' <<<"$line")
+    in_range "$rate" 3 7 || fail "taxa do dd fora de 3–7 MB/s: ${rate:-não encontrada}"
+    rm -f -- "$dst"
+    [[ -e $dst ]] && fail "não conseguiu apagar $dst"
+}
+
 # Montagens da VM, uma por linha. Usado para provar que o /proc montado pelo
 # --mount-proc ficou só dentro do namespace de mount do ambiente.
 mounts() {
@@ -279,6 +363,9 @@ declare -A DESC=(
     [B1]="comando que termina"
     [B2]="comando com erro"
     [B3]="serviço que não termina"
+    [B6]="limite de CPU"
+    [B7]="limite de memória (OOM)"
+    [B8]="limite de IO"
     [B9]="namespace PID (e /proc sem vazar para a VM)"
     [B10]="namespace UTS"
     [B11]="script (executa a cópia)"
@@ -286,7 +373,7 @@ declare -A DESC=(
     [B14]="id duplicado"
     [B15]="não trava o chamador"
 )
-ALL=(B1 B2 B3 B9 B10 B11 B13 B14 B15)
+ALL=(B1 B2 B3 B6 B7 B8 B9 B10 B11 B13 B14 B15)
 
 TESTS=("$@")
 [[ ${#TESTS[@]} -eq 0 ]] && TESTS=("${ALL[@]}")
